@@ -7,3 +7,6 @@ scikit-learn
 scipy
 streamlit
 yfinance
+ecos
+scs
+osqp
