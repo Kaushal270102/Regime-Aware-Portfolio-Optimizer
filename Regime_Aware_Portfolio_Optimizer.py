@@ -789,7 +789,7 @@ class PortfolioOptimizer:
         
         if constraints is None:
             constraints = {
-                'max_weight': 0.4,
+                'max_weight': 0.5,
                 'min_weight': 0.0,
                 'max_sector_weight': 0.6, # Placeholder, needs sector_map
                 'turnover_limit': None,   # Placeholder, needs current_weights
