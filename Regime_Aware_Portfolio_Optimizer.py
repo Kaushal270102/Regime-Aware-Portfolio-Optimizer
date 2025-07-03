@@ -203,8 +203,9 @@ class DataManager:
         prices_df = prices_df.dropna(how='all')  # Drop days with no data
         prices_df = prices_df.fillna(method='ffill', limit=5).fillna(method='bfill')
         
-        # Remove any remaining NaN columns
-        prices_df = prices_df.dropna(axis=1, how='any')
+        # ✅ Drop columns only if more than 20% of data is still missing after forward-fill
+        threshold = int(0.8 * len(prices_df))
+        prices_df = prices_df.dropna(axis=1, thresh=threshold)
         
         if prices_df.empty:
             st.error("❌ No valid price data after alignment")
@@ -223,7 +224,6 @@ class DataManager:
                 upper_bound = mean_ret + 5 * std_ret
                 outliers = (returns_df[col] < lower_bound) | (returns_df[col] > upper_bound)
                 if outliers.sum() > 0:
-                    st.warning(f"⚠️ {col}: Detected {outliers.sum()} outliers ({outliers.sum()/len(returns_df)*100:.1f}% of returns)")
                     returns_df[col] = returns_df[col].clip(lower=lower_bound, upper=upper_bound)
         
         self.prices = prices_df
@@ -789,7 +789,7 @@ class PortfolioOptimizer:
         
         if constraints is None:
             constraints = {
-                'max_weight': 0.5,
+                'max_weight': 1.0,
                 'min_weight': 0.0,
                 'max_sector_weight': 0.6, # Placeholder, needs sector_map
                 'turnover_limit': None,   # Placeholder, needs current_weights
@@ -1780,13 +1780,59 @@ def main():
         return
 
 
+    ticker_to_name = {
+        # 🇮🇳 NSE
+        "RELIANCE.NS": "Reliance Industries",
+        "HDFCBANK.NS": "HDFC Bank",
+        "INFY.NS": "Infosys",
+        "TCS.NS": "Tata Consultancy Services",
+        "ICICIBANK.NS": "ICICI Bank",
+        "SBIN.NS": "State Bank of India",
+        "BHARTIARTL.NS": "Bharti Airtel",
+        "ITC.NS": "ITC Ltd.",
+        "KOTAKBANK.NS": "Kotak Mahindra Bank",
+        "WIPRO.NS": "Wipro Ltd.",
+    
+        # 🇺🇸 NASDAQ
+        "AAPL": "Apple Inc.",
+        "MSFT": "Microsoft Corporation",
+        "GOOGL": "Alphabet Inc.",
+        "AMZN": "Amazon.com Inc.",
+        "TSLA": "Tesla Inc.",
+        "META": "Meta Platforms Inc.",
+        "NFLX": "Netflix Inc.",
+        "NVDA": "NVIDIA Corporation",
+
+        # 🌍 Global ETFs
+        "SPY": "SPDR S&P 500 ETF",
+        "EFA": "iShares MSCI EAFE ETF",
+        "EEM": "iShares MSCI Emerging Markets ETF",
+        "VNQ": "Vanguard Real Estate ETF",
+        "GLD": "SPDR Gold Trust",
+        "TLT": "iShares 20+ Year Treasury Bond ETF",
+        "VIX": "CBOE Volatility Index",
+
+        # ₿ Crypto
+        "BTC-USD": "Bitcoin",
+        "ETH-USD": "Ethereum",
+        "ADA-USD": "Cardano",
+        "BNB-USD": "Binance Coin"
+    }
+
+ 
+
+
     # Analysis Pipeline
     if run_analysis and custom_assets:
         try:
             with st.spinner("🚀 Running comprehensive analysis..."):
+                
                 # Step 1: Data Loading
                 st.info("📊 Step 1: Loading and validating market data...")
                 price_data = data_manager.load_data_with_validation(custom_assets, start_date)
+                st.write("🧾 Sample:")
+                st.dataframe(price_data.head())
+
                 
                 if price_data.empty:
                     st.error("❌ Failed to load data. Please check your asset symbols and try again.")
@@ -1799,6 +1845,35 @@ def main():
                     return
                 
                 st.success(f"✅ Loaded {len(price_data.columns)} assets with {len(price_data)} trading days.")
+                # 📉 Display historical price charts
+                st.subheader("📉 Historical Price Charts of Selected Stocks")
+
+                with st.expander("📂 Show Price Charts"):
+                    for ticker in price_data.columns:
+                        series = pd.to_numeric(price_data[ticker], errors='coerce')
+                        series.index = pd.to_datetime(series.index, errors='coerce')
+                        series = series[series.index.notna()]
+                        # ✅ Get display name
+                        display_name = ticker_to_name.get(ticker, ticker)
+                        if series.isna().all():
+                            st.warning(f"⚠️ No plottable data for {ticker}")
+                        else:
+                            fig = go.Figure()
+                            fig.add_trace(go.Scatter(
+                                x=series.index,
+                                y=series.values,
+                                mode='lines',
+                                name=display_name,
+                                line=dict(color='rgba(100, 100, 255, 0.5)', width=2)
+                        ))
+                            fig.update_layout(
+                                title=f"Price Chart - {display_name}",
+                                xaxis_title="Date",
+                                yaxis_title="Price",
+                                height=400
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+
                 
                 # Step 2: Regime Detection
                 st.info("🔍 Step 2: Detecting market regimes...")
@@ -1832,12 +1907,18 @@ def main():
                     returns_aligned, regime_states_aligned.values, features_aligned
                 )
 
+                # 🧭 Display Current Market Regime
+                current_regime_state = regime_states_aligned.values[-1]
+                regime_name = regime_detector.regime_label_map.get(current_regime_state, f"Regime {current_regime_state}")
+                st.markdown(f"### 🧭 Current Market Regime: `{regime_name}`")
+
+
                 if not regime_characteristics:
                     st.error("❌ Failed to analyze regime characteristics. Check data alignment.")
                     return
 
                 st.success(f"✅ Detected {len(np.unique(regime_states))} market regimes.")
-
+                
                 # Display regime analysis
                 st.markdown('<h2 class="sub-header">🔍 Market Regime Analysis</h2>', unsafe_allow_html=True)
                 dashboard.create_regime_analysis_dashboard(
@@ -1879,6 +1960,21 @@ def main():
 
                 # Step 4: Portfolio Optimization
                 st.info("⚖️ Step 4: Optimizing portfolio...")
+                asset_names = returns_data.columns.tolist()
+        
+                # 🚫 Enforce minimum asset count for CVaR
+                if optimization_method.lower().startswith("cvar") and len(asset_names) < 3:
+                    st.error("❌ CVaR optimization requires at least 3 assets. Please select more assets or use a different method.")
+                    return
+                num_assets = len(asset_names)
+
+                if num_assets < 5:
+                    min_position_size, max_position_size = 0.0, 0.6
+                elif num_assets <= 10:
+                    min_position_size, max_position_size = 0.01, 0.3
+                else:
+                    min_position_size, max_position_size = 0.005, 0.2
+                    
                 constraints = {
                     'max_weight': max_position_size,
                     'min_weight': min_position_size,
@@ -1887,7 +1983,7 @@ def main():
                     'leverage_limit': 1.0
                 }
 
-                asset_names = returns_data.columns.tolist()
+
 
                 optimization_results = optimizer.optimize_portfolio(
                     scenarios=scenarios,
@@ -1909,6 +2005,50 @@ def main():
                     scenarios=scenarios,
                     asset_names=asset_names
                 )
+                # ✅ Plot the expected future portfolio path (mean)
+                if scenarios and 'returns' in scenarios and 'weights' in optimization_results:
+                    sim_returns = scenarios['returns']  # shape: [n_sim, horizon, n_assets]
+                    weights = optimization_results['weights']
+                    portfolio_paths = np.cumprod(1 + np.dot(sim_returns, weights), axis=1)  # shape: [n_sim, horizon]
+                    mean_path = portfolio_paths.mean(axis=0)
+                    lower_bound = np.percentile(portfolio_paths, 5, axis=0)
+                    upper_bound = np.percentile(portfolio_paths, 99, axis=0)
+
+                    st.subheader("📈 Expected Future Portfolio Value ")
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(
+                        y=mean_path,
+                        mode='lines',
+                        line=dict(width=3, color='blue'),
+                        name='Mean Portfolio Path'
+                    ))
+                    # Upper bound
+                    fig.add_trace(go.Scatter(
+                        y=upper_bound,
+                        mode='lines',
+                        line=dict(width=0),
+                        name='95th Percentile',
+                        showlegend=False
+                    ))
+                    # Lower bound + fill between bounds
+                    fig.add_trace(go.Scatter(
+                        y=lower_bound,
+                        mode='lines',
+                        fill='tonexty',
+                        fillcolor='rgba(0, 100, 250, 0.2)',
+                        line=dict(width=0),
+                        name='5th–95th Percentile',
+                        showlegend=True
+                    ))
+                    fig.update_layout(
+                        title="Projected Portfolio Value Over Time",
+                        xaxis_title="Days into the Future",
+                        yaxis_title="Portfolio Value",
+                        height=500
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+
 
                 # Step 5: Stress Testing
                 if enable_stress_testing:
