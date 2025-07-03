@@ -1830,10 +1830,7 @@ def main():
                 # Step 1: Data Loading
                 st.info("📊 Step 1: Loading and validating market data...")
                 price_data = data_manager.load_data_with_validation(custom_assets, start_date)
-                st.write("🧾 Sample:")
-                st.dataframe(price_data.head())
-
-                
+                                
                 if price_data.empty:
                     st.error("❌ Failed to load data. Please check your asset symbols and try again.")
                     return
