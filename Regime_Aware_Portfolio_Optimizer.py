@@ -15,7 +15,8 @@ from datetime import datetime, timedelta
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import plotly.express as px
-from scipy.stats import norm, t, rankdata, jarque_bera, kstest
+from scipy.stats import norm, rankdata, jarque_bera, kstest
+from scipy.stats import t 
 import cvxpy as cp
 from scipy.optimize import minimize
 import itertools
@@ -25,6 +26,7 @@ import io
 import base64
 from typing import Dict, List, Tuple, Optional
 import logging
+from scipy import signal
 
 # Configure logging for better error reporting
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -656,8 +658,8 @@ class MonteCarloEngine:
                 current_regime, transition_matrix, horizon
             )
             
-            for t in range(horizon):
-                regime = regime_path[t]
+            for time_step in range(horizon):
+                regime = regime_path[time_step]
                 
                 if regime not in regime_data:
                     logging.warning(f"Simulated regime {regime} not found in historical data. Using current_regime data.")
@@ -681,13 +683,13 @@ class MonteCarloEngine:
                         params = marginal_params[regime].get(asset, (np.inf, 0, 1)) # Default to standard normal if params missing
                         # Ensure df is not too small for t.ppf
                         df = max(params[0], 1e-6) # degrees of freedom must be > 0
-                        scenarios[sim, t, i] = t.ppf(uniform_samples[i], df, loc=params[1], scale=params[2])
+                        scenarios[sim, time_step, i] = t.ppf(uniform_samples[i], df, loc=params[1], scale=params[2])
                 except Exception as e:
                     logging.warning(f"Copula generation failed for regime {regime} at sim {sim}, time {t}: {e}. Falling back to Gaussian.")
                     # Fallback to Gaussian if copula fails
                     mu = regime_data[regime]['mean'].values
                     cov = regime_data[regime]['cov'].values
-                    scenarios[sim, t, :] = np.random.multivariate_normal(mu, cov)
+                    scenarios[sim, time_step, :] = np.random.multivariate_normal(mu, cov)
         
         return {
             'returns': scenarios,
@@ -1648,297 +1650,549 @@ class DashboardGenerator:
 # =====================================================
 # SECTION 6: 🚀 Main Streamlit Application
 # =====================================================
+# SECTION 6: 🚀 Main Streamlit Application
+# =====================================================
 def main():
-    """Main Streamlit application"""
+    """Main Streamlit application with enhanced visualizations and error handling"""
+    
+    # Custom CSS for better styling
+    st.markdown("""
+    <style>
+    .main-header {
+        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        font-size: 2.5rem;
+        font-weight: bold;
+        text-align: center;
+        margin-bottom: 1rem;
+    }
+    .sub-header {
+        color: #4a5568;
+        border-bottom: 2px solid #e2e8f0;
+        padding-bottom: 0.5rem;
+        margin-bottom: 1rem;
+    }
+    .metric-card {
+        background: white;
+        padding: 1rem;
+        border-radius: 8px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        margin: 0.5rem 0;
+    }
+    .regime-badge {
+        background: linear-gradient(45deg, #ff6b6b, #ffa500);
+        color: white;
+        padding: 0.5rem 1rem;
+        border-radius: 20px;
+        font-weight: bold;
+        display: inline-block;
+        margin: 0.5rem 0;
+    }
+    </style>
+    """, unsafe_allow_html=True)
     
     # Header
     st.markdown('<h1 class="main-header">🏦 Regime-Aware Portfolio Optimizer</h1>', unsafe_allow_html=True)
-    st.markdown("""
-    ### 🎯 Features
-    - **Advanced Regime Detection**: HMM, GMM, and hybrid approaches
-    - **Multiple Optimization Methods**: CVaR, Mean-Variance, Risk Parity, Multi-Objective
-    - **Comprehensive Risk Management**: VaR, CVaR, Drawdown, Stress Testing
-    - **Rich Visualizations**: Interactive dashboards and analytics
-    - **Multiple Asset Classes**: Stocks, ETFs, Cryptocurrencies, Global Markets
-    """)
     
-    # Initialize components
-    data_manager = DataManager()
-    regime_detector = RegimeDetector()
-    mc_engine = MonteCarloEngine()
-    optimizer = PortfolioOptimizer()
-    dashboard = DashboardGenerator()
-    
-    # Sidebar Configuration
-    st.sidebar.title("⚙️ Configuration Panel")
-    st.sidebar.subheader("📊 Data Configuration")
-    exchange = st.sidebar.selectbox("Select Exchange/Universe", ["NSE", "NASDAQ", "Global_ETFs", "Crypto", "Custom"])
-    
-    custom_assets = []
-    if exchange == "Custom":
-        asset_input = st.sidebar.text_area("Enter asset symbols (one per line)", value="AAPL\nMSFT\nGOOGL\nAMZN\nSPY\n^NSEI")
-        custom_assets = [sym.strip().upper() for sym in asset_input.split('\n') if sym.strip()]
-    else:
-        predefined_assets = data_manager.get_asset_universe(exchange)
-        default_selection = predefined_assets[:min(5, len(predefined_assets))] if predefined_assets else []
-        selected_assets = st.sidebar.multiselect(f"Select assets from {exchange}", predefined_assets, default=default_selection)
-        custom_assets = selected_assets
-    
-    if not custom_assets:
-        st.sidebar.warning("Please select or enter at least one asset symbol.")
-        run_analysis = False
-    else:
-        # Time Period Selection
-        st.sidebar.subheader("📅 Time Period")
-        lookback_period = st.sidebar.selectbox("Historical Data Period", ["1 Year", "2 Years", "3 Years", "5 Years", "10 Years"], index=2)
-        period_map = {"1 Year": 365, "2 Years": 730, "3 Years": 1095, "5 Years": 1825, "10 Years": 3650}
-        start_date = (datetime.now() - timedelta(days=period_map[lookback_period])).strftime('%Y-%m-%d')
-        
-        # Regime Detection Settings
-        st.sidebar.subheader("🔍 Regime Detection")
-        n_regimes = st.sidebar.slider("Number of Market Regimes", 2, 5, 3)
-        regime_method = st.sidebar.selectbox("Detection Method", ["HMM (Recommended)", "HMM + GMM Comparison"])
-        
-        # Monte Carlo Settings
-        st.sidebar.subheader("🎲 Monte Carlo Simulation")
-        n_simulations = st.sidebar.slider("Number of Simulations", 500, 10000, 2000, step=500)
-        simulation_horizon = st.sidebar.slider("Horizon (Trading Days)", 21, 252, 126, step=21)
-        simulation_display = st.sidebar.selectbox("Simulation Method", ["Gaussian", "Copula (Fat-tailed)", "Bootstrap"])
-
-        # Map display labels to internal method names
-        simulation_method_map = {
-            "Gaussian": "gaussian",
-            "Copula (Fat-tailed)": "copula",
-            "Bootstrap": "bootstrap"
-        }
-        simulation_method = simulation_method_map.get(simulation_display)
-        if simulation_method is None:
-            st.error(f"Invalid simulation method selected: {simulation_display}")
-            logging.error(f"Invalid simulation method: {simulation_display}")
-            return
-        
-        # Optimization Settings
-        st.sidebar.subheader("⚖️ Portfolio Optimization")
-        optimization_display = st.sidebar.selectbox(
-            "Optimization Method", 
-            ["CVaR (Recommended)", "Mean-Variance", "Risk Parity", "Multi-Objective"]
-        )
-  
-        # Map display labels to internal method names
-        optimization_method_map = {
-            "CVaR (Recommended)": "cvar",
-            "Mean-Variance": "mean_variance",
-            "Risk Parity": "risk_parity",
-            "Multi-Objective": "multi_objective"
-        }
-
-        optimization_method = optimization_method_map[optimization_display]
-
-        # Risk Management Settings
-        st.sidebar.subheader("🛡️ Risk Management")
-        var_confidence = st.sidebar.slider("VaR/CVaR Confidence Level", 0.90, 0.99, 0.95, 0.01)
-        max_position_size = st.sidebar.slider("Max Position Size (per asset)", 0.1, 1.0, 0.3, 0.05)
-        min_position_size = st.sidebar.slider("Min Position Size (per asset)", 0.0, 0.1, 0.01, 0.01)
-        
-        # Advanced Settings
-        with st.sidebar.expander("🔧 Advanced Settings"):
-            enable_sector_constraints = st.checkbox("Enable Sector Constraints (Conceptual)", False)
-            enable_turnover_control = st.checkbox("Enable Turnover Control (Conceptual)", False)
-            enable_stress_testing = st.checkbox("Enable Stress Testing", True)
-            use_transaction_costs = st.checkbox("Include Transaction Costs (Conceptual)", False)
-        
-        run_analysis = st.sidebar.button("🚀 Run Complete Analysis", type="primary")
-    
-    # Main Content Area
-    if not run_analysis:
+    # Feature overview
+    with st.expander("🎯 Application Features", expanded=False):
         col1, col2, col3 = st.columns(3)
         with col1:
             st.markdown("""
-            #### 🔍 Regime Detection
-            - Hidden Markov Models
-            - Transition Matrices
-            - Regime Characteristics
-            - Persistence Analysis
+            #### 🔍 Advanced Regime Detection
+            - Hidden Markov Models (HMM)
+            - Gaussian Mixture Models (GMM)
+            - Regime transition analysis
+            - Persistence metrics
             """)
         with col2:
             st.markdown("""
-            #### 🎲 Scenario Generation
-            - Monte Carlo Simulation
-            - Fat-tailed Distributions
-            - Regime-Conditioned Paths
-            - Bootstrap Methods
+            #### 🎲 Monte Carlo Simulation
+            - Multiple distribution types
+            - Regime-conditioned scenarios
+            - Fat-tailed modeling
+            - Bootstrap resampling
             """)
         with col3:
             st.markdown("""
-            #### ⚖️ Optimization
-            - CVaR Minimization
-            - Multi-Objective
-            - Risk Budgeting
-            - Stress Testing
+            #### ⚖️ Portfolio Optimization
+            - CVaR minimization
+            - Multi-objective optimization
+            - Risk parity approach
+            - Comprehensive stress testing
             """)
-        st.info("👆 Configure your parameters in the sidebar and click 'Run Complete Analysis' to begin!")
-        return
-
-
-    ticker_to_name = {
-        # 🇮🇳 NSE
-        "RELIANCE.NS": "Reliance Industries",
-        "HDFCBANK.NS": "HDFC Bank",
-        "INFY.NS": "Infosys",
-        "TCS.NS": "Tata Consultancy Services",
-        "ICICIBANK.NS": "ICICI Bank",
-        "SBIN.NS": "State Bank of India",
-        "BHARTIARTL.NS": "Bharti Airtel",
-        "ITC.NS": "ITC Ltd.",
-        "KOTAKBANK.NS": "Kotak Mahindra Bank",
-        "WIPRO.NS": "Wipro Ltd.",
     
-        # 🇺🇸 NASDAQ
-        "AAPL": "Apple Inc.",
-        "MSFT": "Microsoft Corporation",
-        "GOOGL": "Alphabet Inc.",
-        "AMZN": "Amazon.com Inc.",
-        "TSLA": "Tesla Inc.",
-        "META": "Meta Platforms Inc.",
-        "NFLX": "Netflix Inc.",
-        "NVDA": "NVIDIA Corporation",
-
-        # 🌍 Global ETFs
-        "SPY": "SPDR S&P 500 ETF",
-        "EFA": "iShares MSCI EAFE ETF",
-        "EEM": "iShares MSCI Emerging Markets ETF",
-        "VNQ": "Vanguard Real Estate ETF",
-        "GLD": "SPDR Gold Trust",
-        "TLT": "iShares 20+ Year Treasury Bond ETF",
-        "VIX": "CBOE Volatility Index",
-
-        # ₿ Crypto
-        "BTC-USD": "Bitcoin",
-        "ETH-USD": "Ethereum",
-        "ADA-USD": "Cardano",
-        "BNB-USD": "Binance Coin"
-    }
-
- 
-
-
-    # Analysis Pipeline
-    if run_analysis and custom_assets:
+    # Initialize components with error handling
+    try:
+        data_manager = DataManager()
+        regime_detector = RegimeDetector()
+        mc_engine = MonteCarloEngine()
+        optimizer = PortfolioOptimizer()
+        dashboard = DashboardGenerator()
+    except Exception as e:
+        st.error(f"❌ Failed to initialize components: {str(e)}")
+        st.stop()
+    
+    # Sidebar Configuration
+    st.sidebar.title("⚙️ Configuration Panel")
+    
+    # Data Configuration Section
+    st.sidebar.markdown("### 📊 Data Configuration")
+    exchange = st.sidebar.selectbox(
+        "Select Exchange/Universe", 
+        ["NSE", "NASDAQ", "Global_ETFs", "Crypto", "Custom"],
+        help="Choose your preferred asset universe"
+    )
+    
+    custom_assets = []
+    if exchange == "Custom":
+        asset_input = st.sidebar.text_area(
+            "Enter asset symbols (one per line)", 
+            value="AAPL\nMSFT\nGOOGL\nAMZN\nSPY\n^NSEI",
+            height=150
+        )
+        custom_assets = [sym.strip().upper() for sym in asset_input.split('\n') if sym.strip()]
+    else:
         try:
-            with st.spinner("🚀 Running comprehensive analysis..."):
-                
-                # Step 1: Data Loading
-                st.info("📊 Step 1: Loading and validating market data...")
-                price_data = data_manager.load_data_with_validation(custom_assets, start_date)
-                                
-                if price_data.empty:
-                    st.error("❌ Failed to load data. Please check your asset symbols and try again.")
-                    return
-                
-                returns_data = price_data.pct_change().dropna()
-                
-                if returns_data.empty:
-                    st.error("❌ No valid return data after processing. Check data period or assets.")
-                    return
-                
-                st.success(f"✅ Loaded {len(price_data.columns)} assets with {len(price_data)} trading days.")
-                # 📉 Display historical price charts
-                st.subheader("📉 Historical Price Charts of Selected Stocks")
-
-                with st.expander("📂 Show Price Charts"):
-                    for ticker in price_data.columns:
-                        series = pd.to_numeric(price_data[ticker], errors='coerce')
-                        series.index = pd.to_datetime(series.index, errors='coerce')
-                        series = series[series.index.notna()]
-                        # ✅ Get display name
+            predefined_assets = data_manager.get_asset_universe(exchange)
+            if not predefined_assets:
+                st.sidebar.error(f"No assets available for {exchange}")
+                custom_assets = []
+            else:
+                default_selection = predefined_assets[:min(5, len(predefined_assets))]
+                selected_assets = st.sidebar.multiselect(
+                    f"Select assets from {exchange}", 
+                    predefined_assets, 
+                    default=default_selection
+                )
+                custom_assets = selected_assets
+        except Exception as e:
+            st.sidebar.error(f"Error loading {exchange} assets: {str(e)}")
+            custom_assets = []
+    
+    # Validation
+    if not custom_assets:
+        st.sidebar.warning("⚠️ Please select at least one asset symbol.")
+        st.info("👆 Configure your parameters in the sidebar to begin analysis!")
+        return
+    
+    if len(custom_assets) < 3:
+        st.sidebar.warning("⚠️ For optimal results, please select at least 3 assets.")
+    
+    # Time Period Selection
+    st.sidebar.markdown("### 📅 Time Period")
+    lookback_period = st.sidebar.selectbox(
+        "Historical Data Period", 
+        ["1 Year", "2 Years", "3 Years", "5 Years", "10 Years"], 
+        index=2
+    )
+    period_map = {"1 Year": 365, "2 Years": 730, "3 Years": 1095, "5 Years": 1825, "10 Years": 3650}
+    start_date = (datetime.now() - timedelta(days=period_map[lookback_period])).strftime('%Y-%m-%d')
+    
+    # Regime Detection Settings
+    st.sidebar.markdown("### 🔍 Regime Detection")
+    n_regimes = st.sidebar.slider("Number of Market Regimes", 2, 5, 3)
+    regime_method = st.sidebar.selectbox(
+        "Detection Method", 
+        ["HMM (Recommended)", "HMM + GMM Comparison"],
+        help="HMM is generally more robust for time series data"
+    )
+    
+    # Monte Carlo Settings
+    st.sidebar.markdown("### 🎲 Monte Carlo Simulation")
+    n_simulations = st.sidebar.slider("Number of Simulations", 500, 10000, 2000, step=500)
+    simulation_horizon = st.sidebar.slider("Horizon (Trading Days)", 21, 252, 126, step=21)
+    simulation_display = st.sidebar.selectbox(
+        "Simulation Method", 
+        ["Gaussian", "Copula (Fat-tailed)", "Bootstrap"],
+        help="Copula captures fat tails better, Bootstrap uses historical patterns"
+    )
+    
+    # Map display labels to internal method names
+    simulation_method_map = {
+        "Gaussian": "gaussian",
+        "Copula (Fat-tailed)": "copula",
+        "Bootstrap": "bootstrap"
+    }
+    simulation_method = simulation_method_map.get(simulation_display)
+    
+    # Optimization Settings
+    st.sidebar.markdown("### ⚖️ Portfolio Optimization")
+    optimization_display = st.sidebar.selectbox(
+        "Optimization Method", 
+        ["CVaR (Recommended)", "Mean-Variance", "Risk Parity", "Multi-Objective"],
+        help="CVaR focuses on tail risk, Mean-Variance on risk-return tradeoff"
+    )
+    
+    optimization_method_map = {
+        "CVaR (Recommended)": "cvar",
+        "Mean-Variance": "mean_variance",
+        "Risk Parity": "risk_parity",
+        "Multi-Objective": "multi_objective"
+    }
+    optimization_method = optimization_method_map[optimization_display]
+    
+    # Risk Management Settings
+    st.sidebar.markdown("### 🛡️ Risk Management")
+    var_confidence = st.sidebar.slider("VaR/CVaR Confidence Level", 0.90, 0.99, 0.95, 0.01)
+    
+    # Dynamic position sizing based on number of assets
+    num_assets = len(custom_assets)
+    if num_assets < 5:
+        default_max, default_min = 0.6, 0.0
+    elif num_assets <= 10:
+        default_max, default_min = 0.3, 0.01
+    else:
+        default_max, default_min = 0.2, 0.005
+    
+    max_position_size = st.sidebar.slider("Max Position Size (per asset)", 0.1, 1.0, default_max, 0.05)
+    min_position_size = st.sidebar.slider("Min Position Size (per asset)", 0.0, 0.1, default_min, 0.01)
+    
+    # Advanced Settings
+    with st.sidebar.expander("🔧 Advanced Settings"):
+        enable_sector_constraints = st.checkbox("Enable Sector Constraints", False)
+        enable_turnover_control = st.checkbox("Enable Turnover Control", False)
+        enable_stress_testing = st.checkbox("Enable Stress Testing", True)
+        use_transaction_costs = st.checkbox("Include Transaction Costs", False)
+        show_debug_info = st.checkbox("Show Debug Information", False)
+    
+    # Run Analysis Button
+    run_analysis = st.sidebar.button("🚀 Run Complete Analysis", type="primary")
+    
+    # Asset name mapping for display
+    ticker_to_name = {
+        # NSE
+        "RELIANCE.NS": "Reliance Industries", "HDFCBANK.NS": "HDFC Bank", "INFY.NS": "Infosys",
+        "TCS.NS": "Tata Consultancy Services", "ICICIBANK.NS": "ICICI Bank", "SBIN.NS": "State Bank of India",
+        "BHARTIARTL.NS": "Bharti Airtel", "ITC.NS": "ITC Ltd.", "KOTAKBANK.NS": "Kotak Mahindra Bank",
+        "WIPRO.NS": "Wipro Ltd.",
+        # NASDAQ
+        "AAPL": "Apple Inc.", "MSFT": "Microsoft Corporation", "GOOGL": "Alphabet Inc.",
+        "AMZN": "Amazon.com Inc.", "TSLA": "Tesla Inc.", "META": "Meta Platforms Inc.",
+        "NFLX": "Netflix Inc.", "NVDA": "NVIDIA Corporation",
+        # Global ETFs
+        "SPY": "SPDR S&P 500 ETF", "EFA": "iShares MSCI EAFE ETF", "EEM": "iShares MSCI Emerging Markets ETF",
+        "VNQ": "Vanguard Real Estate ETF", "GLD": "SPDR Gold Trust", "TLT": "iShares 20+ Year Treasury Bond ETF",
+        # Crypto
+        "BTC-USD": "Bitcoin", "ETH-USD": "Ethereum", "ADA-USD": "Cardano", "BNB-USD": "Binance Coin"
+    }
+    
+    # Main Analysis Pipeline
+    if run_analysis:
+        try:
+            # Progress tracking
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            # Step 1: Data Loading (20% progress)
+            status_text.text("📊 Loading and validating market data...")
+            progress_bar.progress(20)
+            
+            price_data = data_manager.load_data_with_validation(custom_assets, start_date)
+            
+            if price_data.empty:
+                st.error("❌ Failed to load data. Please check your asset symbols and try again.")
+                return
+            
+            returns_data = price_data.pct_change().dropna()
+            
+            if returns_data.empty:
+                st.error("❌ No valid return data after processing. Check data period or assets.")
+                return
+            
+            # Data summary
+            st.success(f"✅ Loaded {len(price_data.columns)} assets with {len(price_data)} trading days.")
+            
+            # Display data sample
+            with st.expander("📂 Data Sample", expanded=False):
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.write("**Price Data Sample:**")
+                    st.dataframe(price_data.head())
+                with col2:
+                    st.write("**Returns Data Sample:**")
+                    st.dataframe(returns_data.head())
+            
+            # Historical price charts
+            st.markdown('<h2 class="sub-header">📈 Historical Price Analysis</h2>', unsafe_allow_html=True)
+            
+            # Create price chart tabs
+            if len(custom_assets) <= 6:
+                # Show all charts if few assets
+                cols = st.columns(min(len(custom_assets), 3))
+                for i, ticker in enumerate(custom_assets):
+                    with cols[i % 3]:
                         display_name = ticker_to_name.get(ticker, ticker)
-                        if series.isna().all():
-                            st.warning(f"⚠️ No plottable data for {ticker}")
-                        else:
+                        series = price_data[ticker].dropna()
+                        
+                        if not series.empty:
                             fig = go.Figure()
                             fig.add_trace(go.Scatter(
                                 x=series.index,
                                 y=series.values,
                                 mode='lines',
                                 name=display_name,
-                                line=dict(color='rgba(100, 100, 255, 0.5)', width=2)
-                        ))
+                                line=dict(width=2)
+                            ))
                             fig.update_layout(
-                                title=f"Price Chart - {display_name}",
-                                xaxis_title="Date",
-                                yaxis_title="Price",
-                                height=400
+                                title=f"{display_name}",
+                                height=300,
+                                showlegend=False,
+                                margin=dict(l=0, r=0, t=30, b=0)
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+            else:
+                # Use selectbox for many assets
+                selected_ticker = st.selectbox(
+                    "Select asset to view price chart:", 
+                    custom_assets,
+                    format_func=lambda x: ticker_to_name.get(x, x)
+                )
+                
+                display_name = ticker_to_name.get(selected_ticker, selected_ticker)
+                series = price_data[selected_ticker].dropna()
+                
+                if not series.empty:
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(
+                        x=series.index,
+                        y=series.values,
+                        mode='lines',
+                        name=display_name,
+                        line=dict(width=2, color='#667eea')
+                    ))
+                    fig.update_layout(
+                        title=f"Price Chart - {display_name}",
+                        xaxis_title="Date",
+                        yaxis_title="Price",
+                        height=400
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+            
+            # Step 2: Regime Detection (40% progress)
+            status_text.text("🔍 Detecting market regimes...")
+            progress_bar.progress(40)
+            
+            primary_asset_returns = returns_data.iloc[:, 0].copy()
+            features = regime_detector.prepare_features(primary_asset_returns)
+            
+            if regime_method == "HMM (Recommended)":
+                regime_states, hmm_model = regime_detector.fit_hmm(features, n_states=n_regimes)
+            else:
+                regime_states, hmm_model = regime_detector.fit_hmm(features, n_states=n_regimes)
+                gmm_states = regime_detector.fit_gmm_comparison(features, n_states=n_regimes)
+            
+            if regime_states is None or hmm_model is None:
+                st.error("❌ Regime detection failed. Check data or reduce number of regimes.")
+                return
+            
+            # Align data
+            aligned_index = features.index
+            returns_aligned = primary_asset_returns.loc[aligned_index]
+            regime_states_aligned = pd.Series(regime_states, index=aligned_index)
+            
+            regime_characteristics = regime_detector.analyze_regime_characteristics(
+                returns_aligned, regime_states_aligned.values, features
+            )
+            
+            if not regime_characteristics:
+                st.error("❌ Failed to analyze regime characteristics.")
+                return
+            
+            st.success(f"✅ Detected {len(np.unique(regime_states))} market regimes.")
+            
+            # Current regime display
+            current_regime_state = regime_states_aligned.values[-1]
+            regime_name = regime_detector.regime_label_map.get(current_regime_state, f"Regime {current_regime_state}")
+            st.markdown(f'<div class="regime-badge">🧭 Current Market Regime: {regime_name}</div>', unsafe_allow_html=True)
+            
+            # Enhanced Regime Analysis Dashboard
+            st.markdown('<h2 class="sub-header">🔍 Market Regime Analysis</h2>', unsafe_allow_html=True)
+            
+            # Regime visualization tabs
+            tab1, tab2, tab3 = st.tabs(["📊 Regime Timeline", "📈 Regime Characteristics", "🔄 Transition Matrix"])
+            
+            with tab1:
+                # Regime timeline chart
+                fig = go.Figure()
+                
+                # Add returns as background
+                fig.add_trace(go.Scatter(
+                    x=returns_aligned.index,
+                    y=returns_aligned.values,
+                    mode='lines',
+                    name='Returns',
+                    line=dict(color='lightgray', width=1),
+                    opacity=0.6
+                ))
+                
+                # Add regime coloring
+                colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7']
+                for regime in np.unique(regime_states):
+                    mask = regime_states_aligned == regime
+                    regime_label = regime_detector.regime_label_map.get(regime, f"Regime {regime}")
+                    
+                    fig.add_trace(go.Scatter(
+                        x=returns_aligned.index[mask],
+                        y=returns_aligned.values[mask],
+                        mode='markers',
+                        name=regime_label,
+                        marker=dict(
+                            color=colors[regime % len(colors)],
+                            size=4
+                        )
+                    ))
+                
+                fig.update_layout(
+                    title="Market Regime Timeline",
+                    xaxis_title="Date",
+                    yaxis_title="Returns",
+                    height=500,
+                    hovermode='x unified'
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                window_size = min(21, len(returns_aligned) // 10)  # Adaptive window size
+                if window_size > 1:
+                    smoothed_returns = signal.savgol_filter(returns_aligned.values, window_size, 3)
+                    fig.add_trace(go.Scatter(
+                        x=returns_aligned.index,
+                        y=smoothed_returns,
+                        mode='lines',
+                        name='Trend Line',
+                        line=dict(color='black', width=2, dash='dash'),
+                        opacity=0.8
+                    ))
+            
+            with tab2:
+                # Regime characteristics
+                regime_stats = []
+                for regime, stats in regime_characteristics.items():
+                    regime_stats.append({
+                        'Regime': regime,
+                        'Mean Return': f"{stats.get('mean_return', 0):.4f}",
+                        'Volatility': f"{stats.get('volatility', 0):.4f}",
+                        'Persistence': f"{stats.get('persistence', 0):.3f}",
+                        'Duration (days)': f"{stats.get('avg_duration', 0):.1f}"
+                    })
+                
+                st.dataframe(pd.DataFrame(regime_stats), use_container_width=True)
+                
+                # Regime distribution plots
+                cols = st.columns(2)
+                with cols[0]:
+                    # Return distribution by regime
+                    fig = go.Figure()
+                    for regime in np.unique(regime_states):
+                        mask = regime_states_aligned == regime
+                        regime_returns = returns_aligned[mask]
+                        regime_label = regime_detector.regime_label_map.get(regime, f"Regime {regime}")
+                        
+                        fig.add_trace(go.Histogram(
+                            x=regime_returns,
+                            name=regime_label,
+                            opacity=0.7,
+                            nbinsx=30
+                        ))
+                    
+                    fig.update_layout(
+                        title="Return Distribution by Regime",
+                        xaxis_title="Returns",
+                        yaxis_title="Frequency",
+                        barmode='overlay',
+                        height=400
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                with cols[1]:
+                    # Regime duration analysis
+                    durations = []
+                    current_regime = regime_states_aligned.values[0]
+                    current_duration = 1
+                    
+                    for i in range(1, len(regime_states_aligned)):
+                        if regime_states_aligned.values[i] == current_regime:
+                            current_duration += 1
+                        else:
+                            durations.append({
+                                'Regime': regime_detector.regime_label_map.get(current_regime, f"Regime {current_regime}"),
+                                'Duration': current_duration
+                            })
+                            current_regime = regime_states_aligned.values[i]
+                            current_duration = 1
+                    
+                    # Replace the existing box plot section with:
+                    if durations:
+                        duration_df = pd.DataFrame(durations)
+                        # Calculate regime percentages
+                        regime_counts = regime_states_aligned.value_counts()
+                        total_periods = len(regime_states_aligned)
+    
+                        regime_percentages = []
+                        for regime in np.unique(regime_states):
+                            regime_label = regime_detector.regime_label_map.get(regime, f"Regime {regime}")
+                            percentage = (regime_counts.get(regime, 0) / total_periods) * 100
+                            regime_percentages.append({
+                                'Regime': regime_label,
+                                'Percentage': percentage
+                            })                    
+                        percentage_df = pd.DataFrame(regime_percentages)
+    
+                        fig = go.Figure([go.Bar(
+                            x=percentage_df['Regime'],
+                            y=percentage_df['Percentage'],
+                            marker_color=['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7'][:len(percentage_df)]
+                        )])
+    
+                        fig.update_layout(
+                            title="Regime Distribution (%)",
+                            xaxis_title="Regime",
+                            yaxis_title="Percentage (%)",
+                            height=400
                         )
                         st.plotly_chart(fig, use_container_width=True)
-
-                
-                # Step 2: Regime Detection
-                st.info("🔍 Step 2: Detecting market regimes...")
-                primary_asset_returns = returns_data.iloc[:, 0].copy()
-                if not isinstance(primary_asset_returns, pd.Series):
-                    logging.error(f"primary_asset_returns is not a pandas Series, got {type(primary_asset_returns)}")
-                    st.error("❌ Internal error: primary_asset_returns is not a pandas Series")
-                    return
-                
-                logging.info(f"primary_asset_returns type: {type(primary_asset_returns)}, shape: {primary_asset_returns.shape}")
-                
-                features = regime_detector.prepare_features(primary_asset_returns)
-
-                if regime_method == "HMM (Recommended)":
-                    regime_states, hmm_model = regime_detector.fit_hmm(features, n_states=n_regimes)
-                else:
-                    regime_states, hmm_model = regime_detector.fit_hmm(features, n_states=n_regimes)
-                    gmm_states = regime_detector.fit_gmm_comparison(features, n_states=n_regimes)
-
-                if regime_states is None or hmm_model is None:
-                    st.error("❌ Regime detection failed. Check data or reduce number of regimes.")
-                    return
-
-                # Align all data to feature index
-                aligned_index = features.index
-                returns_aligned = primary_asset_returns.loc[aligned_index]
-                features_aligned = features
-                regime_states_aligned = pd.Series(regime_states, index=aligned_index)
-
-                regime_characteristics = regime_detector.analyze_regime_characteristics(
-                    returns_aligned, regime_states_aligned.values, features_aligned
-                )
-
-                # 🧭 Display Current Market Regime
-                current_regime_state = regime_states_aligned.values[-1]
-                regime_name = regime_detector.regime_label_map.get(current_regime_state, f"Regime {current_regime_state}")
-                st.markdown(f"### 🧭 Current Market Regime: `{regime_name}`")
-
-
-                if not regime_characteristics:
-                    st.error("❌ Failed to analyze regime characteristics. Check data alignment.")
-                    return
-
-                st.success(f"✅ Detected {len(np.unique(regime_states))} market regimes.")
-                
-                # Display regime analysis
-                st.markdown('<h2 class="sub-header">🔍 Market Regime Analysis</h2>', unsafe_allow_html=True)
-                dashboard.create_regime_analysis_dashboard(
-                    returns_aligned.to_frame(),
-                    regime_states_aligned.values,
-                    regime_characteristics,
-                    features_aligned,
-                    regime_detector.regime_label_map  # Pass regime_label_map
-                )
-
-                # Step 3: Monte Carlo Simulation
-                st.info("🎲 Step 3: Generating Monte Carlo scenarios...")
-                current_regime = regime_states_aligned.values[-1]
-
-                # Log current regime with descriptive label
-                if not regime_detector.regime_label_map:
-                    logging.warning("regime_label_map is empty. Falling back to numerical regime.")
-                    current_regime_label = f"Regime {current_regime}"
-                else:
-                    current_regime_label = regime_detector.regime_label_map.get(current_regime, f"Regime {current_regime}")
-
-                st.info(f"Generating scenarios starting in {current_regime_label}")
-
+            
+            with tab3:
+                # Transition matrix
+                if hasattr(hmm_model, 'transmat_'):
+                    transition_matrix = hmm_model.transmat_
+                    regime_labels = [regime_detector.regime_label_map.get(i, f"Regime {i}") 
+                                   for i in range(len(transition_matrix))]
+                    
+                    fig = go.Figure(data=go.Heatmap(
+                        z=transition_matrix,
+                        x=regime_labels,
+                        y=regime_labels,
+                        colorscale='Viridis',
+                        text=np.round(transition_matrix, 3),
+                        texttemplate="%{text}",
+                        textfont={"size": 12}
+                    ))
+                    
+                    fig.update_layout(
+                        title="Regime Transition Matrix",
+                        xaxis_title="To Regime",
+                        yaxis_title="From Regime",
+                        height=500
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Transition insights
+                    st.write("**Key Insights:**")
+                    diagonal_persistence = np.diag(transition_matrix)
+                    for i, persistence in enumerate(diagonal_persistence):
+                        regime_label = regime_labels[i]
+                        st.write(f"- {regime_label}: {persistence:.1%} persistence probability")
+            
+            # Step 3: Monte Carlo Simulation (60% progress)
+            
+            status_text.text("🎲 Generating Monte Carlo scenarios...")
+            progress_bar.progress(60)
+            
+            current_regime = regime_states_aligned.values[-1]
+            current_regime_label = regime_detector.regime_label_map.get(current_regime, f"Regime {current_regime}")
+            
+            try:
                 scenarios = mc_engine.generate_regime_scenarios(
                     returns=returns_data.loc[aligned_index],
                     regime_states=regime_states_aligned.values,
@@ -1948,194 +2202,750 @@ def main():
                     method=simulation_method.lower(),
                     regime_label_map=regime_detector.regime_label_map
                 )
-
+                
+                # Validate scenarios output
+                if not isinstance(scenarios, dict):
+                    st.error(f"❌ Monte Carlo simulation returned unexpected type: {type(scenarios)}. Expected a dictionary.")
+                    logging.error(f"Monte Carlo simulation returned {type(scenarios)} instead of dict: {scenarios}")
+                    return
+                
                 if not scenarios:
-                    st.error("❌ Monte Carlo simulation failed. Check regime data or simulation parameters.")
+                    st.error("❌ Monte Carlo simulation failed to generate valid scenarios.")
                     return
-
+                
                 st.success(f"✅ Generated {n_simulations} scenarios over {simulation_horizon} days.")
-
-                # Step 4: Portfolio Optimization
-                st.info("⚖️ Step 4: Optimizing portfolio...")
-                asset_names = returns_data.columns.tolist()
-        
-                # 🚫 Enforce minimum asset count for CVaR
-                if optimization_method.lower().startswith("cvar") and len(asset_names) < 3:
-                    st.error("❌ CVaR optimization requires at least 3 assets. Please select more assets or use a different method.")
-                    return
-                num_assets = len(asset_names)
-
-                if num_assets < 5:
-                    min_position_size, max_position_size = 0.0, 0.6
-                elif num_assets <= 10:
-                    min_position_size, max_position_size = 0.01, 0.3
+                
+            except Exception as e:
+                st.error(f"❌ Monte Carlo simulation failed: {str(e)}")
+                logging.error("Monte Carlo simulation error:", exc_info=True)
+                return
+            
+            # Enhanced Monte Carlo Analysis
+            st.markdown('<h2 class="sub-header">🎲 Monte Carlo Simulation Analysis</h2>', unsafe_allow_html=True)
+            
+            # Monte Carlo tabs
+            mc_tab1, mc_tab2, mc_tab3 = st.tabs(["📊 Scenario Paths", "📈 Distribution Comparison", "🎯 Risk Metrics"])
+            
+            with mc_tab1:
+                if 'returns' in scenarios:
+                    sim_returns = scenarios['returns']
+            
+                    # Use optimized weights if available, otherwise use equal weights
+                    portfolio_weights = (optimization_results.get('weights', np.ones(len(custom_assets)) / len(custom_assets)) 
+                                        if 'optimization_results' in locals() and optimization_results 
+                                        else np.ones(len(custom_assets)) / len(custom_assets))
+            
+                    portfolio_sim_returns = np.zeros((sim_returns.shape[0], sim_returns.shape[1]))
+                    for i in range(sim_returns.shape[0]):
+                        portfolio_sim_returns[i] = np.dot(sim_returns[i], portfolio_weights)
+            
+                    portfolio_paths = np.cumprod(1 + portfolio_sim_returns, axis=1)
+                    sample_size = min(50, len(portfolio_paths))
+                    sample_paths = portfolio_paths[:sample_size]
+            
+                    fig = go.Figure()
+                    for i in range(min(20, len(sample_paths))):
+                        fig.add_trace(go.Scatter(
+                            y=sample_paths[i],
+                            mode='lines',
+                            line=dict(width=1, color='rgba(100,149,237,0.3)'),
+                            showlegend=False,
+                            hovertemplate='Day: %{x}<br>Portfolio Value: %{y:.3f}<extra></extra>'
+                        ))
+            
+                    percentiles = [10, 25, 50, 75, 90]
+                    percentile_paths = {}
+                    for p in percentiles:
+                        percentile_paths[p] = np.percentile(portfolio_paths, p, axis=0)
+            
+                    fig.add_trace(go.Scatter(y=percentile_paths[90], mode='lines', line=dict(width=0), showlegend=False))
+                    fig.add_trace(go.Scatter(y=percentile_paths[10], mode='lines', fill='tonexty', fillcolor='rgba(100,149,237,0.1)', line=dict(width=0), name='10th-90th percentile', showlegend=True))
+                    fig.add_trace(go.Scatter(y=percentile_paths[75], mode='lines', line=dict(width=0), showlegend=False))
+                    fig.add_trace(go.Scatter(y=percentile_paths[25], mode='lines', fill='tonexty', fillcolor='rgba(100,149,237,0.2)', line=dict(width=0), name='25th-75th percentile', showlegend=True))
+                    fig.add_trace(go.Scatter(y=percentile_paths[50], mode='lines', line=dict(width=3, color='blue'), name='Median Path'))
+            
+                    mean_path = np.mean(portfolio_paths, axis=0)
+                    fig.add_trace(go.Scatter(y=mean_path, mode='lines', line=dict(width=3, color='red', dash='dash'), name='Mean Path'))
+            
+                    fig.update_layout(
+                        title=f"Portfolio Simulation Paths ({n_simulations:,} simulations)",
+                        xaxis_title="Days",
+                        yaxis_title="Portfolio Value (Starting Value = 1.0)",
+                        height=600,
+                        hovermode='x unified'
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+            
+                    final_values = portfolio_paths[:, -1]
+                    final_returns = final_values - 1
+            
+                    stats_cols = st.columns(5)
+                    with stats_cols[0]:
+                        st.metric("Expected Final Value", f"{np.mean(final_values):.3f}")
+                    with stats_cols[1]:
+                        st.metric("Expected Return", f"{np.mean(final_returns):.2%}")
+                    with stats_cols[2]:
+                        st.metric("Volatility", f"{np.std(final_returns):.2%}")
+                    with stats_cols[3]:
+                        st.metric("Best Case (90%)", f"{np.percentile(final_returns, 90):.2%}")
+                    with stats_cols[4]:
+                        st.metric("Worst Case (10%)", f"{np.percentile(final_returns, 10):.2%}")
+            
+                    positive_returns = np.sum(final_returns > 0) / len(final_returns)
+                    st.metric("Success Rate", f"{positive_returns:.1%}", help="Probability of positive returns")
+            
+                    weights_label = 'optimized' if 'optimization_results' in locals() and optimization_results and 'weights' in optimization_results else 'equal'
+                    st.info(f"📌 Simulations starting from {current_regime_label} regime using {simulation_display} method with {weights_label} weights")
+            
+                    with st.expander("📊 Detailed Portfolio Statistics"):
+                        col1, col2 = st.columns(2)
+            
+                        with col1:
+                            st.write("**Return Distribution:**")
+                            quartiles = np.percentile(final_returns, [25, 50, 75])
+                            st.write(f"- 25th percentile: {quartiles[0]:.2%}")
+                            st.write(f"- Median: {quartiles[1]:.2%}")
+                            st.write(f"- 75th percentile: {quartiles[2]:.2%}")
+                            st.write(f"- Skewness: {pd.Series(final_returns).skew():.3f}")
+                            st.write(f"- Kurtosis: {pd.Series(final_returns).kurtosis():.3f}")
+            
+                        with col2:
+                            st.write("**Path Statistics:**")
+                            max_values = np.max(portfolio_paths, axis=1)
+                            min_values = np.min(portfolio_paths, axis=1)
+                            st.write(f"- Average maximum value: {np.mean(max_values):.3f}")
+                            st.write(f"- Average minimum value: {np.mean(min_values):.3f}")
+                            st.write(f"- Paths ending above 1.0: {np.sum(final_values > 1.0)}/{len(final_values)}")
+                            st.write(f"- Paths ending below 0.8: {np.sum(final_values < 0.8)}/{len(final_values)}")
                 else:
-                    min_position_size, max_position_size = 0.005, 0.2
+                    st.warning("⚠️ No valid simulation data available. Please check Monte Carlo settings.")
+            
+            
+
+            with mc_tab2:
+                # Distribution comparison across methods
+                st.subheader("🔄 Simulation Method Comparison")
+                
+                methods = ["gaussian", "copula", "bootstrap"]
+                final_returns = {}
+                
+                for method in methods:
+                    try:
+                        temp_scenarios = mc_engine.generate_regime_scenarios(
+                            returns=returns_data.loc[aligned_index],
+                            regime_states=regime_states_aligned.values,
+                            current_regime=current_regime,
+                            n_simulations=min(1000, n_simulations),  # Limit for comparison
+                            horizon=simulation_horizon,
+                            method=method,
+                            regime_label_map=regime_detector.regime_label_map
+                        )
+                        
+                        if temp_scenarios and "returns" in temp_scenarios:
+                            # Calculate final returns for first asset
+                            path_returns = np.cumprod(1 + temp_scenarios["returns"][:, :, 0], axis=1)[:, -1] - 1
+                            final_returns[method] = path_returns
+                    except Exception as e:
+                        st.warning(f"Could not generate {method} scenarios: {str(e)}")
+                
+                if final_returns:
+                    fig = go.Figure()
+                    colors = ['blue', 'red', 'green']
+    
+                    for i, (method, returns) in enumerate(final_returns.items()):
+                        # Calculate histogram data manually
+                        hist, bin_edges = np.histogram(returns, bins=30, density=True)  
+                        # Create x values for the line (bin centers)
+                        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+        
+                        # Add line trace
+                        fig.add_trace(go.Scatter(
+                            x=bin_centers,
+                            y=hist,
+                            mode='lines',
+                            name=method.title(),
+                            line=dict(width=2, color=colors[i])
+                        ))
+    
+                    fig.update_layout(
+                        title="Final Return Distribution Comparison",
+                        xaxis_title="Final Returns",
+                        yaxis_title="Frequency",
+                        height=400,
+                        barmode='overlay',  # Overlay histograms for better comparison
+                        showlegend=True
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
                     
-                constraints = {
-                    'max_weight': max_position_size,
-                    'min_weight': min_position_size,
-                    'max_sector_weight': None,
-                    'turnover_limit': None,
-                    'leverage_limit': 1.0
-                }
+                    # Statistical comparison
+                    comparison_stats = []
+                    for method, returns in final_returns.items():
+                        comparison_stats.append({
+                            'Method': method.title(),
+                            'Mean': f"{np.mean(returns):.4f}",
+                            'Std': f"{np.std(returns):.4f}",
+                            'Skewness': f"{pd.Series(returns).skew():.3f}",
+                            'Kurtosis': f"{pd.Series(returns).kurtosis():.3f}"
+                        })
+                    
+                    st.dataframe(pd.DataFrame(comparison_stats), use_container_width=True)
+            
 
-
-
-                optimization_results = optimizer.optimize_portfolio(
-                    scenarios=scenarios,
-                    method=optimization_method,
-                    constraints=constraints,
-                    asset_names=asset_names
-                )
-
-                if not optimization_results:
-                    st.error("❌ Portfolio optimization failed.")
-                    return
-
-                st.success("✅ Portfolio optimized successfully.")
-
-                # Display optimization dashboard
-                st.markdown('<h2 class="sub-header">📊 Portfolio Optimization Results</h2>', unsafe_allow_html=True)
-                dashboard.create_portfolio_dashboard(
-                    optimization_results=optimization_results,
-                    scenarios=scenarios,
-                    asset_names=asset_names
-                )
-                # ✅ Plot the expected future portfolio path (mean)
-                if scenarios and 'returns' in scenarios and 'weights' in optimization_results:
-                    sim_returns = scenarios['returns']  # shape: [n_sim, horizon, n_assets]
-                    weights = optimization_results['weights']
-                    portfolio_paths = np.cumprod(1 + np.dot(sim_returns, weights), axis=1)  # shape: [n_sim, horizon]
-                    mean_path = portfolio_paths.mean(axis=0)
-                    lower_bound = np.percentile(portfolio_paths, 5, axis=0)
-                    upper_bound = np.percentile(portfolio_paths, 99, axis=0)
-
-                    st.subheader("📈 Expected Future Portfolio Value ")
+            
+            with mc_tab3:
+                # Risk metrics from simulation
+                if 'returns' in scenarios:
+                    # Calculate portfolio-level metrics (using equal weights for now)
+                    equal_weights = np.ones(len(custom_assets)) / len(custom_assets)
+                    portfolio_returns = np.dot(scenarios['returns'], equal_weights)
+                    final_portfolio_returns = np.cumprod(1 + portfolio_returns, axis=1)[:, -1] - 1
+                    
+                    # Risk metrics
+                    var_95 = np.percentile(final_portfolio_returns, 5)
+                    var_99 = np.percentile(final_portfolio_returns, 1)
+                    cvar_95 = np.mean(final_portfolio_returns[final_portfolio_returns <= var_95])
+                    cvar_99 = np.mean(final_portfolio_returns[final_portfolio_returns <= var_99])
+                    
+                    # Display metrics
+                    metric_cols = st.columns(4)
+                    with metric_cols[0]:
+                        st.metric("VaR (95%)", f"{var_95:.2%}")
+                    with metric_cols[1]:
+                        st.metric("VaR (99%)", f"{var_99:.2%}")
+                    with metric_cols[2]:
+                        st.metric("CVaR (95%)", f"{cvar_95:.2%}")
+                    with metric_cols[3]:
+                        st.metric("CVaR (99%)", f"{cvar_99:.2%}")
+                    
+                    # Risk-return scatter
                     fig = go.Figure()
                     fig.add_trace(go.Scatter(
+                        x=np.std(portfolio_returns, axis=1),
+                        y=np.mean(portfolio_returns, axis=1),
+                        mode='markers',
+                        marker=dict(
+                            size=4,
+                            color=final_portfolio_returns,
+                            colorscale='RdYlBu',
+                            showscale=True,
+                            colorbar=dict(title="Final Return")
+                        ),
+                        name='Simulations'
+                    ))
+                    
+                    fig.update_layout(
+                        title="Risk-Return Scatter (Equal Weight Portfolio)",
+                        xaxis_title="Volatility",
+                        yaxis_title="Mean Return",
+                        height=400
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+            
+            # Step 4: Portfolio Optimization (80% progress)
+            status_text.text("⚖️ Optimizing portfolio...")
+            progress_bar.progress(80)
+            
+            # Validation for CVaR
+            if optimization_method.lower().startswith("cvar") and len(custom_assets) < 3:
+                st.error("❌ CVaR optimization requires at least 3 assets. Please select more assets or use a different method.")
+                return
+            
+            # Set up constraints
+            constraints = {
+                'max_weight': max_position_size,
+                'min_weight': min_position_size,
+                'max_sector_weight': None,
+                'turnover_limit': None,
+                'leverage_limit': 1.0
+            }
+            
+            optimization_results = optimizer.optimize_portfolio(
+                scenarios=scenarios,
+                method=optimization_method,
+                constraints=constraints,
+                asset_names=custom_assets
+            )
+            
+            if not optimization_results:
+                st.error("❌ Portfolio optimization failed.")
+                return
+            
+            st.success("✅ Portfolio optimized successfully.")
+            
+            # Enhanced Portfolio Results Dashboard
+            st.markdown('<h2 class="sub-header">📊 Portfolio Optimization Results</h2>', unsafe_allow_html=True)
+            
+            # Portfolio tabs
+            port_tab1, port_tab2, port_tab3, port_tab4 = st.tabs(["🎯 Allocation", "📈 Performance", "🛡️ Risk Analysis", "📊 Efficient Frontier"])
+            
+            with port_tab1:
+                # Portfolio allocation visualization
+                weights = optimization_results.get('weights', np.ones(len(custom_assets)) / len(custom_assets))
+                
+                # Pie chart
+                fig = go.Figure(data=[go.Pie(
+                    labels=[ticker_to_name.get(asset, asset) for asset in custom_assets],
+                    values=weights,
+                    hole=0.3,
+                    textinfo='label+percent',
+                    textposition='outside'
+                )])
+                
+                fig.update_layout(
+                    title="Portfolio Allocation",
+                    height=500,
+                    showlegend=True
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Allocation table
+                allocation_df = pd.DataFrame({
+                    'Asset': [ticker_to_name.get(asset, asset) for asset in custom_assets],
+                    'Symbol': custom_assets,
+                    'Weight': weights,
+                    'Weight (%)': [f"{w:.2%}" for w in weights]
+                }).sort_values('Weight', ascending=False)
+                
+                st.dataframe(allocation_df, use_container_width=True)
+                
+                # Portfolio statistics
+                if 'expected_return' in optimization_results:
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Expected Return", f"{optimization_results['expected_return']:.2%}")
+                    with col2:
+                        st.metric("Expected Volatility", f"{optimization_results.get('volatility', 0):.2%}")
+                    with col3:
+                        st.metric("Sharpe Ratio", f"{optimization_results.get('sharpe_ratio', 0):.3f}")
+            
+            with port_tab2:
+                # Portfolio performance projection
+                if 'returns' in scenarios and 'weights' in optimization_results:
+                    sim_returns = scenarios['returns']
+                    portfolio_paths = np.cumprod(1 + np.dot(sim_returns, weights), axis=1)
+                    
+                    # Performance metrics
+                    mean_path = np.mean(portfolio_paths, axis=0)
+                    percentiles = [5, 25, 75, 95]
+                    percentile_paths = {p: np.percentile(portfolio_paths, p, axis=0) for p in percentiles}
+                    
+                    fig = go.Figure()
+                    
+                    # Add percentile bands
+                    fig.add_trace(go.Scatter(
+                        x=list(range(len(mean_path))),
+                        y=percentile_paths[95],
+                        mode='lines',
+                        line=dict(width=0),
+                        showlegend=False,
+                        name='95th percentile'
+                    ))
+                    
+                    fig.add_trace(go.Scatter(
+                        x=list(range(len(mean_path))),
+                        y=percentile_paths[5],
+                        mode='lines',
+                        fill='tonexty',
+                        fillcolor='rgba(0,100,80,0.1)',
+                        line=dict(width=0),
+                        name='5th-95th percentile',
+                        showlegend=True
+                    ))
+                    
+                    fig.add_trace(go.Scatter(
+                        x=list(range(len(mean_path))),
+                        y=percentile_paths[75],
+                        mode='lines',
+                        line=dict(width=0),
+                        showlegend=False
+                    ))
+                    
+                    fig.add_trace(go.Scatter(
+                        x=list(range(len(mean_path))),
+                        y=percentile_paths[25],
+                        mode='lines',
+                        fill='tonexty',
+                        fillcolor='rgba(0,100,80,0.2)',
+                        line=dict(width=0),
+                        name='25th-75th percentile',
+                        showlegend=True
+                    ))
+                    
+                    # Add mean path
+                    fig.add_trace(go.Scatter(
+                        x=list(range(len(mean_path))),
                         y=mean_path,
                         mode='lines',
                         line=dict(width=3, color='blue'),
-                        name='Mean Portfolio Path'
+                        name='Expected Path'
                     ))
-                    # Upper bound
-                    fig.add_trace(go.Scatter(
-                        y=upper_bound,
-                        mode='lines',
-                        line=dict(width=0),
-                        name='95th Percentile',
-                        showlegend=False
-                    ))
-                    # Lower bound + fill between bounds
-                    fig.add_trace(go.Scatter(
-                        y=lower_bound,
-                        mode='lines',
-                        fill='tonexty',
-                        fillcolor='rgba(0, 100, 250, 0.2)',
-                        line=dict(width=0),
-                        name='5th–95th Percentile',
-                        showlegend=True
-                    ))
+                    
                     fig.update_layout(
-                        title="Projected Portfolio Value Over Time",
-                        xaxis_title="Days into the Future",
+                        title="Portfolio Value Projection",
+                        xaxis_title="Days",
                         yaxis_title="Portfolio Value",
                         height=500
                     )
                     st.plotly_chart(fig, use_container_width=True)
-
-
-
-                # Step 5: Stress Testing
-                if enable_stress_testing:
-                    dashboard.perform_stress_testing(
-                        returns_data.loc[aligned_index],
-                        regime_states_aligned.values,
-                        optimization_results['weights'],
-                        regime_detector.regime_label_map  # Pass regime_label_map
+                    
+                    # Performance statistics
+                    final_returns = portfolio_paths[:, -1] - 1
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Expected Final Return", f"{np.mean(final_returns):.2%}")
+                    with col2:
+                        st.metric("Volatility", f"{np.std(final_returns):.2%}")
+                    with col3:
+                        st.metric("Best Case (95%)", f"{np.percentile(final_returns, 95):.2%}")
+                    with col4:
+                        st.metric("Worst Case (5%)", f"{np.percentile(final_returns, 5):.2%}")
+            
+            with port_tab3:
+                # Risk analysis
+                if 'returns' in scenarios and 'weights' in optimization_results:
+                    portfolio_returns = np.dot(scenarios['returns'], weights)
+                    daily_returns = portfolio_returns.flatten()
+                    
+                    # Risk metrics
+                    var_95 = np.percentile(daily_returns, 5)
+                    var_99 = np.percentile(daily_returns, 1)
+                    cvar_95 = np.mean(daily_returns[daily_returns <= var_95])
+                    cvar_99 = np.mean(daily_returns[daily_returns <= var_99])
+                    
+                    # Display risk metrics
+                    risk_col1, risk_col2, risk_col3, risk_col4 = st.columns(4)
+                    with risk_col1:
+                        st.metric("Daily VaR (95%)", f"{var_95:.2%}")
+                    with risk_col2:
+                        st.metric("Daily VaR (99%)", f"{var_99:.2%}")
+                    with risk_col3:
+                        st.metric("Daily CVaR (95%)", f"{cvar_95:.2%}")
+                    with risk_col4:
+                        st.metric("Daily CVaR (99%)", f"{cvar_99:.2%}")
+                    
+                    # Return distribution
+                    fig = go.Figure()
+                    fig.add_trace(go.Histogram(
+                        x=daily_returns,
+                        nbinsx=50,
+                        name='Daily Returns',
+                        opacity=0.7
+                    ))
+                    
+                    # Add VaR lines
+                    fig.add_vline(x=var_95, line_dash="dash", line_color="red", 
+                                annotation_text="VaR 95%")
+                    fig.add_vline(x=var_99, line_dash="dash", line_color="darkred", 
+                                annotation_text="VaR 99%")
+                    
+                    fig.update_layout(
+                        title="Portfolio Daily Return Distribution",
+                        xaxis_title="Daily Returns",
+                        yaxis_title="Frequency",
+                        height=400
                     )
-
-                # Export Options
-                dashboard._provide_export_options(
-                    optimization_results=optimization_results,
-                    regime_characteristics=regime_characteristics,
-                    asset_names=asset_names
-                )
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Drawdown analysis
+                    cumulative_returns = np.cumprod(1 + np.mean(portfolio_returns, axis=0))
+                    rolling_max = np.maximum.accumulate(cumulative_returns)
+                    drawdowns = (cumulative_returns - rolling_max) / rolling_max
+                    
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(
+                        x=list(range(len(drawdowns))),
+                        y=drawdowns,
+                        mode='lines',
+                        fill='tozeroy',
+                        name='Drawdown'
+                    ))
+                    
+                    fig.update_layout(
+                        title="Expected Portfolio Drawdown",
+                        xaxis_title="Days",
+                        yaxis_title="Drawdown",
+                        height=300
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    st.metric("Maximum Expected Drawdown", f"{np.min(drawdowns):.2%}")
+            
+            with port_tab4:
+                # Efficient frontier (if available)
+                if optimization_method in ['mean_variance', 'multi_objective']:
+                    st.info("Efficient frontier analysis available for Mean-Variance and Multi-Objective optimization")
+                    
+                    # Generate efficient frontier points
+                    risk_levels = np.linspace(0.05, 0.3, 20)
+                    frontier_returns = []
+                    frontier_risks = []
+                    
+                    for risk in risk_levels:
+                        try:
+                            temp_constraints = constraints.copy()
+                            temp_constraints['target_risk'] = risk
+                            
+                            temp_result = optimizer.optimize_portfolio(
+                                scenarios=scenarios,
+                                method='mean_variance',
+                                constraints=temp_constraints,
+                                asset_names=custom_assets
+                            )
+                            
+                            if temp_result:
+                                frontier_returns.append(temp_result.get('expected_return', 0))
+                                frontier_risks.append(temp_result.get('volatility', risk))
+                        except:
+                            continue
+                    
+                    if frontier_returns and frontier_risks:
+                        fig = go.Figure()
+                        
+                        # Efficient frontier
+                        fig.add_trace(go.Scatter(
+                            x=frontier_risks,
+                            y=frontier_returns,
+                            mode='lines+markers',
+                            name='Efficient Frontier',
+                            line=dict(width=2, color='blue')
+                        ))
+                        
+                        # Current portfolio
+                        if 'volatility' in optimization_results and 'expected_return' in optimization_results:
+                            fig.add_trace(go.Scatter(
+                                x=[optimization_results['volatility']],
+                                y=[optimization_results['expected_return']],
+                                mode='markers',
+                                marker=dict(size=12, color='red'),
+                                name='Current Portfolio'
+                            ))
+                        
+                        fig.update_layout(
+                            title="Efficient Frontier",
+                            xaxis_title="Risk (Volatility)",
+                            yaxis_title="Expected Return",
+                            height=500
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info(f"Efficient frontier not available for {optimization_display} method")
+            
+            # Step 5: Stress Testing (if enabled)
+            if enable_stress_testing:
+                progress_bar.progress(90)
+                status_text.text("🛡️ Performing stress tests...")
                 
-        except Exception as e:
-            st.error(f"❌ An error occurred during analysis: {str(e)}")
-            logging.error("Analysis pipeline error:", exc_info=True)
-    
-
-def perform_stress_testing(self, scenarios: Dict, weights: np.ndarray, asset_names: List[str]):
-    """Perform stress testing on the portfolio"""
-    if weights is None or scenarios.get('returns') is None:
-        st.warning("Cannot perform stress testing: Missing weights or scenarios.")
-        return
-    
-    returns_array = scenarios['returns']
-    n_sim, horizon, n_assets = returns_array.shape
-    
-    # Calculate portfolio returns
-    portfolio_returns = (1 + returns_array).prod(axis=1) @ weights - 1
-    
-    # Stress scenarios
-    stress_scenarios = {
-        'Market Crash (-30%)': np.full(n_assets, -0.30),
-        'Volatility Spike (2x)': np.std(returns_array, axis=1) * 2,
-        'Liquidity Shock': np.random.uniform(-0.1, -0.05, n_assets)
-    }
-    
-    stress_results = []
-    for name, shock in stress_scenarios.items():
-        if 'Crash' in name or 'Liquidity' in name:
-            stress_return = shock @ weights
-        else:  # Volatility spike
-            stress_return = np.mean(portfolio_returns) - shock @ weights
+                st.markdown('<h2 class="sub-header">🛡️ Stress Testing</h2>', unsafe_allow_html=True)
+                
+                # Stress test scenarios
+                stress_scenarios = {
+                    'Market Crash (-30%)': -0.30,
+                    'Volatility Spike (2x)': 2.0,
+                    'Sector Rotation': 0.15,
+                    'Liquidity Crisis': -0.15,
+                    'Interest Rate Shock': -0.20
+                }
+                
+                stress_results = []
+                for scenario_name, shock_magnitude in stress_scenarios.items():
+                    if 'Crash' in scenario_name:
+                        # Apply uniform negative shock
+                        shock_returns = np.full(len(custom_assets), shock_magnitude)
+                        portfolio_impact = np.dot(weights, shock_returns)
+                    elif 'Volatility' in scenario_name:
+                        # Increase volatility
+                        base_vol = np.std(returns_data, axis=0)
+                        portfolio_vol = np.sqrt(np.dot(weights, np.dot(np.cov(returns_data.T), weights)))
+                        portfolio_impact = -(portfolio_vol * shock_magnitude - portfolio_vol)
+                    else:
+                        # Random sector-specific shock
+                        np.random.seed(42)  # For reproducibility
+                        shock_returns = np.random.normal(0, abs(shock_magnitude), len(custom_assets))
+                        portfolio_impact = np.dot(weights, shock_returns)
+                    
+                    stress_results.append({
+                        'Stress Scenario': scenario_name,
+                        'Portfolio Impact': f"{portfolio_impact:.2%}",
+                        'Severity': 'High' if abs(portfolio_impact) > 0.10 else 'Medium' if abs(portfolio_impact) > 0.05 else 'Low'
+                    })
+                
+                # Display stress test results
+                stress_df = pd.DataFrame(stress_results)
+                
+                # Color code by severity
+                def color_severity(val):
+                    if val == 'High':
+                        return 'background-color: #ffcccc'
+                    elif val == 'Medium':
+                        return 'background-color: #fff3cd'
+                    else:
+                        return 'background-color: #d4edda'
+                
+                styled_df = stress_df.style.applymap(color_severity, subset=['Severity'])
+                st.dataframe(styled_df, use_container_width=True)
+                
+                # Stress test visualization
+                impacts = [float(result['Portfolio Impact'].strip('%')) / 100 for result in stress_results]
+                scenarios = [result['Stress Scenario'] for result in stress_results]
+                
+                fig = go.Figure([go.Bar(
+                    x=scenarios,
+                    y=impacts,
+                    marker_color=['red' if impact < 0 else 'green' for impact in impacts]
+                )])
+                
+                fig.update_layout(
+                    title="Stress Test Results",
+                    xaxis_title="Stress Scenario",
+                    yaxis_title="Portfolio Impact",
+                    height=400
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            
+            # Step 6: Export Options (100% progress)
+            progress_bar.progress(100)
+            status_text.text("✅ Analysis complete!")
+            
+            st.markdown('<h2 class="sub-header">💾 Export Results</h2>', unsafe_allow_html=True)
+            
+            # Export portfolio weights
+            if 'weights' in optimization_results:
+                weights_df = pd.DataFrame({
+                    'Asset': custom_assets,
+                    'Name': [ticker_to_name.get(asset, asset) for asset in custom_assets],
+                    'Weight': weights,
+                    'Weight (%)': [f"{w:.2%}" for w in weights]
+                })
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.download_button(
+                        label="📥 Download Portfolio Weights",
+                        data=weights_df.to_csv(index=False),
+                        file_name=f"portfolio_weights_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                        mime="text/csv"
+                    )
+                
+                with col2:
+                    # Export regime analysis
+                    regime_data = []
+                    for regime, stats in regime_characteristics.items():
+                        regime_data.append({
+                            'Regime': regime,
+                            'Mean Return': stats.get('mean_return', 0),
+                            'Volatility': stats.get('volatility', 0),
+                            'Persistence': stats.get('persistence', 0),
+                            'Avg Duration': stats.get('avg_duration', 0)
+                        })
+                    
+                    regime_df = pd.DataFrame(regime_data)
+                    st.download_button(
+                        label="📥 Download Regime Analysis",
+                        data=regime_df.to_csv(index=False),
+                        file_name=f"regime_analysis_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                        mime="text/csv"
+                    )
+            
+            # Summary report
+            with st.expander("📋 Analysis Summary Report"):
+                st.markdown(f"""
+                **Portfolio Analysis Summary**
+                
+                **Data:**
+                - Assets: {len(custom_assets)} ({', '.join(custom_assets[:3])}{'...' if len(custom_assets) > 3 else ''})
+                - Period: {lookback_period} ({len(price_data)} trading days)
+                - Exchange: {exchange}
+                
+                **Regime Analysis:**
+                - Method: {regime_method}
+                - Regimes Detected: {len(np.unique(regime_states))}
+                - Current Regime: {current_regime_label}
+                
+                **Monte Carlo:**
+                - Simulations: {n_simulations:,}
+                - Horizon: {simulation_horizon} days
+                - Method: {simulation_display}
+                
+                **Optimization:**
+                - Method: {optimization_display}
+                - Max Position: {max_position_size:.1%}
+                - Min Position: {min_position_size:.1%}
+                
+                **Risk Metrics:**
+                - VaR Confidence: {var_confidence:.1%}
+                - Stress Testing: {'Enabled' if enable_stress_testing else 'Disabled'}
+                """)
+            
+            # Clear progress indicators
+            progress_bar.empty()
+            status_text.empty()
+            
+            # Debug information
+            if show_debug_info:
+                with st.expander("🔧 Debug Information"):
+                    st.write("**Optimization Results Keys:**", list(optimization_results.keys()) if 'optimization_results' in locals() and optimization_results else "None")
+                    st.write("**Scenarios Keys:**", list(scenarios.keys()) if isinstance(scenarios, dict) else f"Invalid type: {type(scenarios)}")
+                    st.write("**Regime States Shape:**", regime_states_aligned.shape if regime_states_aligned is not None else "None")
+                    st.write("**Returns Data Shape:**", returns_data.shape)
+                    st.write("**Price Data Shape:**", price_data.shape)
         
-        stress_results.append({
-            'Scenario': name,
-            'Portfolio Impact': f"{stress_return:.2%}"
-        })
-    
-    st.subheader("Stress Test Outcomes")
-    st.dataframe(pd.DataFrame(stress_results), use_container_width=True)
+        except Exception as e:
+            st.error(f"❌ Analysis failed: {str(e)}")
+            if show_debug_info:
+                st.exception(e)
+            logging.error("Analysis pipeline error:", exc_info=True)
+            
+    else:
+        # Welcome screen when analysis is not running
+        st.markdown("""
+        <div style="text-align: center; padding: 2rem; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+                   border-radius: 10px; color: white; margin: 2rem 0;">
+            <h2>🚀 Ready to Optimize Your Portfolio?</h2>
+            <p>Configure your parameters in the sidebar and click 'Run Complete Analysis' to begin!</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Feature highlights
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.markdown("""
+            <div class="metric-card">
+                <h4>🔍 Regime Detection</h4>
+                <ul>
+                    <li>Hidden Markov Models</li>
+                    <li>Transition Matrices</li>
+                    <li>Regime Characteristics</li>
+                    <li>Persistence Analysis</li>
+                </ul>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col2:
+            st.markdown("""
+            <div class="metric-card">
+                <h4>🎲 Monte Carlo Simulation</h4>
+                <ul>
+                    <li>Multiple Distribution Types</li>
+                    <li>Regime-Conditioned Paths</li>
+                    <li>Fat-tailed Modeling</li>
+                    <li>Bootstrap Methods</li>
+                </ul>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col3:
+            st.markdown("""
+            <div class="metric-card">
+                <h4>⚖️ Portfolio Optimization</h4>
+                <ul>
+                    <li>CVaR Minimization</li>
+                    <li>Multi-Objective Optimization</li>
+                    <li>Risk Budgeting</li>
+                    <li>Comprehensive Stress Testing</li>
+                </ul>
+            </div>
+            """, unsafe_allow_html=True)
 
-def _provide_export_options(self, optimization_results: Dict, regime_characteristics: Dict, 
-                          asset_names: List[str]):
-    """Provide options to export results"""
-    st.markdown('<h2 class="sub-header">💾 Export Results</h2>', unsafe_allow_html=True)
-    
-    # Export portfolio weights
-    if optimization_results.get('weights') is not None:
-        weights_df = pd.DataFrame({
-            'Asset': asset_names,
-            'Weight': optimization_results['weights']
-        })
-        weights_csv = weights_df.to_csv(index=False)
-        st.download_button(
-            label="📥 Download Portfolio Weights (CSV)",
-            data=weights_csv,
-            file_name="portfolio_weights.csv",
-            mime="text/csv"
-        )
-    
-    # Export regime characteristics
-    regime_data = []
-    for regime, stats in regime_characteristics.items():
-        regime_data.append({
-            'Regime': regime,
-            **{k: v for k, v in stats.items()}
-        })
-    regime_df = pd.DataFrame(regime_data)
-    regime_csv = regime_df.to_csv(index=False)
-    st.download_button(
-        label="📥 Download Regime Characteristics (CSV)",
-        data=regime_csv,
-        file_name="regime_characteristics.csv",
-        mime="text/csv"
-    )
 
 if __name__ == "__main__":
     main()
